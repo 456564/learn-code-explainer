@@ -2,7 +2,6 @@ import * as vscode from 'vscode';
 import { scanProject } from './projectScanner';
 import { callOllama, checkOllamaHealth } from './ollama';
 import { buildPrompt, parseCommentResponse } from './commentGenerator';
-import { formatCommentBlock } from './formatter';
 import { getConfig } from './settings';
 
 export function activate(context: vscode.ExtensionContext) {
@@ -87,29 +86,25 @@ async function explainSelectedCode(): Promise<void> {
 
             progress.report({ message: '📝 整理注释格式...' });
 
-            // 7. 解析 + 格式化
-            const parsed = parseCommentResponse(rawResponse);
-            if (!parsed) {
+            // 7. 解析 Ollama 返回（期望是原代码+注释的完整版本）
+            let result = parseCommentResponse(rawResponse);
+            if (!result) {
                 vscode.window.showWarningMessage('Ollama 返回了空结果，请重试。');
                 return;
             }
 
-            const formatted = formatCommentBlock(parsed);
+            // 8. 去掉 markdown 代码块包裹（如果有）
+            result = result.replace(/^```[\w]*\n?/g, '').replace(/\n?```$/g, '').trim();
 
-            // 8. 获取选中区域的尾行（插入位置）
-            const lastLine = selection.end.line;
-            const insertPosition = new vscode.Position(lastLine + 1, 0);
-
-            // 9. 插入注释
+            // 9. 直接用完整结果替换选中的代码
             await editor.edit(editBuilder => {
-                editBuilder.insert(insertPosition, '\n' + formatted + '\n');
+                editBuilder.replace(selection, result);
             });
 
-            // 10. 滚动到插入位置
-            const newPosition = new vscode.Position(lastLine + 1, 0);
-            editor.selection = new vscode.Selection(newPosition, newPosition);
+            // 10. 滚动到替换后的位置
+            const newSelection = editor.selection;
             editor.revealRange(
-                new vscode.Range(lastLine + 1, 0, lastLine + 1, 0),
+                new vscode.Range(newSelection.start, newSelection.end),
                 vscode.TextEditorRevealType.InCenter
             );
 
