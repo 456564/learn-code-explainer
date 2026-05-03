@@ -1,0 +1,89 @@
+{
+  "name": "learn-code-explainer",
+  "displayName": "Learn Code Explainer",
+  "description": "学习型代码详解注释插件 — 读取整个工程上下文，生成逐行原理级注释",
+  "version": "0.1.0",
+  "publisher": "learner",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/learner/learn-code-explainer"
+  },
+  "activationEvents": [
+    "onCommand:learnCodeExplainer.explainCode"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "learnCodeExplainer.explainCode",
+        "title": "Learn Code: 详解选中代码",
+        "category": "Learn Code"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "learnCodeExplainer.explainCode",
+          "when": "editorTextFocus && editorHasSelection",
+          "group": "navigation"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "learnCodeExplainer.explainCode",
+        "key": "ctrl+shift+l",
+        "mac": "cmd+shift+l",
+        "when": "editorTextFocus && editorHasSelection"
+      }
+    ],
+    "configuration": {
+      "title": "Learn Code Explainer",
+      "properties": {
+        "learnCodeExplainer.ollamaEndpoint": {
+          "type": "string",
+          "default": "http://localhost:11434",
+          "description": "Ollama API 地址"
+        },
+        "learnCodeExplainer.model": {
+          "type": "string",
+          "default": "qwen2.5-coder:7b",
+          "description": "Ollama 模型名称（推荐 qwen2.5-coder:7b 或 codellama:7b）"
+        },
+        "learnCodeExplainer.timeout": {
+          "type": "number",
+          "default": 120000,
+          "description": "生成注释的超时时间（毫秒），默认 120 秒"
+        },
+        "learnCodeExplainer.maxFiles": {
+          "type": "number",
+          "default": 20,
+          "description": "扫描工程时最多读取的文件数量"
+        },
+        "learnCodeExplainer.maxFileSize": {
+          "type": "number",
+          "default": 51200,
+          "description": "单个文件最大读取字节数（超过则跳过）"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.9.1",
+    "typescript": "^5.3.0",
+    "vsce": "^2.15.0"
+  }
+}
