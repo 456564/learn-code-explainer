@@ -2,7 +2,7 @@
   "name": "learn-code-explainer",
   "displayName": "Learn Code Explainer",
   "description": "学习型代码详解注释插件 — 读取整个工程上下文，生成逐行原理级注释",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "publisher": "learner",
   "engines": {
     "vscode": "^1.85.0"
