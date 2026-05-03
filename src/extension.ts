@@ -27,37 +27,19 @@ export function activate(context: vscode.ExtensionContext) {
 
 export function deactivate() {}
 
-/**
- * 解析 "--- 行 N ---" 格式的注释块
- * 返回 Map<相对行号(1-based), 注释文本>
- */
-function parseNumberedComments(raw: string): Map<number, string> {
-    const result = new Map<number, string>();
-    // 按分隔符分割：--- 行 N ---
-    const parts = raw.split(/---\s*行\s*(\d+)\s*---/i);
-    // parts[0] = 前言（忽略）
-    // parts[1] = 行号1, parts[2] = 注释内容1, parts[3] = 行号2, ...
-    for (let i = 1; i < parts.length; i += 2) {
-        const lineNumStr = parts[i]?.trim();
-        if (!lineNumStr) continue;
-        const lineNum = parseInt(lineNumStr, 10);
-        if (isNaN(lineNum) || lineNum <= 0) continue;
-        const commentRaw = (parts[i + 1] || '').trim();
-        const formatted = formatCommentBlock(commentRaw);
-        if (formatted) {
-            result.set(lineNum, formatted);
-        }
-    }
-    return result;
+interface PendingBlock {
+    lineNum: number;
+    content: string;
 }
 
 /**
- * 核心逻辑：流式生成 + 打字机效果
+ * 核心逻辑：流式生成 + 渐进式按行插入
  *
- * 打字机效果实现方式：
- * 1. 开启 Ollama 流式 API，token 逐个到达
- * 2. 每个 token 实时追加到 Output Channel（可见的打字机效果）
- * 3. 流式结束后，一次性解析并插入所有注释到编辑器
+ * 流程：
+ * 1. Ollama 流式输出 token
+ * 2. 按行累积（遇到 \n），检测 marker（--- 行 N ---）
+ * 3. 看到 marker → 说明上一块完整 → 立即插入上一块
+ * 4. 流结束后 flush 最后一个 pending 块
  */
 async function explainSelectedCode(): Promise<void> {
     const editor = vscode.window.activeTextEditor;
@@ -96,7 +78,7 @@ async function explainSelectedCode(): Promise<void> {
 
     const progressOptions: vscode.ProgressOptions = {
         location: vscode.ProgressLocation.Notification,
-        title: '📖 正在生成注释（流式）',
+        title: '📖 正在生成注释',
         cancellable: false,
     };
 
@@ -110,8 +92,7 @@ async function explainSelectedCode(): Promise<void> {
             const filePath = doc.fileName;
             const projectContext = await scanProject(fileUri);
 
-            progress.report({ message: '🤖 Ollama 正在生成（可在 Output 面板查看实时输出）...' });
-            channel.appendLine('🤖 正在调用 Ollama 生成注释...\n');
+            progress.report({ message: '🤖 Ollama 正在生成（注释将逐块插入）...' });
 
             const language = detectLanguage(filePath);
             const prompt = buildPrompt({
@@ -121,55 +102,126 @@ async function explainSelectedCode(): Promise<void> {
                 filePath,
             });
 
+            // ---- 渐进式插入状态 ----
+            let lineBuffer = '';                           // 当前行缓冲区
+            let pending: PendingBlock | null = null;      // 待插入的注释块
+            let lineOffset = 0;                            // 累积插入行数偏移
+            const insertedLines = new Set<number>();       // 已插入的行号（去重）
+            let insertedCount = 0;                         // 已插入块数
+
+            // ---- 辅助函数：插入注释块 ----
+            async function insertPending(block: PendingBlock): Promise<boolean> {
+                if (insertedLines.has(block.lineNum)) {
+                    return false;
+                }
+
+                const comment = block.content.trim();
+                if (!comment) {
+                    return false;
+                }
+
+                const formatted = formatCommentBlock(comment);
+                const absLine = startLine + (block.lineNum - 1) + lineOffset;
+
+                try {
+                    if (!editor) return false;
+                    await editor.edit(editBuilder => {
+                        editBuilder.insert(
+                            new vscode.Position(absLine + 1, 0),
+                            formatted + '\n'
+                        );
+                    });
+
+                    insertedLines.add(block.lineNum);
+                    const insertedLineCount = formatted.split('\n').length;
+                    lineOffset += insertedLineCount;
+                    insertedCount++;
+
+                    channel.appendLine(`  ✅ [行 ${block.lineNum}] 已插入`);
+                    return true;
+                } catch (err) {
+                    const msg = err instanceof Error ? err.message : String(err);
+                    channel.appendLine(`  ⚠️ [行 ${block.lineNum}] 插入失败: ${msg}`);
+                    return false;
+                }
+            }
+
+            // ---- 辅助函数：处理一行完整文本 ----
+            async function processLine(line: string): Promise<void> {
+                const trimmed = line.trim();
+                // 匹配 marker: --- 行 N ---
+                const match = trimmed.match(/^---\s*行\s*(\d+)\s*---$/i);
+
+                if (match) {
+                    // 这是 marker 行
+                    const lineNum = parseInt(match[1], 10);
+
+                    // 插入上一块（如果有）
+                    if (pending) {
+                        await insertPending(pending);
+                        pending = null;
+                    }
+
+                    // 当前 marker 的注释内容等下一行
+                    pending = { lineNum, content: '' };
+                } else {
+                    // 普通行：追加到 pending 内容
+                    if (pending) {
+                        pending.content += line;
+                    }
+                }
+            }
+
             // ---- 流式读取 Ollama ----
-            let fullResponse = '';
+            channel.append('🤖 ');
             let charCount = 0;
 
-            channel.append('🤖 ');
             for await (const token of callOllamaStream({ prompt })) {
-                fullResponse += token;
                 charCount += token.length;
+                lineBuffer += token;
+
+                // Output Channel 打字机效果
                 channel.append(token);
 
-                // 每 200 字符更新一次进度通知（避免频繁刷新）
-                if (charCount % 200 === 0) {
+                // 持续处理完整行（可能多个）
+                while (true) {
+                    const newlineIndex = lineBuffer.indexOf('\n');
+                    if (newlineIndex === -1) {
+                        break; // 没有完整行，等待更多 token
+                    }
+
+                    // 提取一行
+                    const line = lineBuffer.slice(0, newlineIndex + 1);
+                    lineBuffer = lineBuffer.slice(newlineIndex + 1);
+
+                    // 处理这一行
+                    await processLine(line);
+
+                    // 进度更新（每插入 3 块更新一次通知）
+                    if (insertedCount > 0 && insertedCount % 3 === 0) {
+                        progress.report({ message: `🤖 已插入 ${insertedCount} 处注释...` });
+                    }
+                }
+
+                // 全局进度通知（避免过于频繁）
+                if (charCount % 500 === 0) {
                     progress.report({ message: `🤖 已生成 ${charCount} 字符...` });
                 }
             }
 
-            channel.appendLine('\n\n✅ 流式生成完成！正在解析并插入注释...\n');
-            progress.report({ message: '📝 解析注释并插入...' });
-
-            // ---- 解析并插入注释 ----
-            const commentMap = parseNumberedComments(fullResponse);
-
-            if (commentMap.size === 0) {
-                // 降级：无法解析出行号，把全文当成一个注释块插入到选中代码后面
-                channel.appendLine('⚠️ 未检测到行号格式，将完整输出插入到代码末尾。');
-                const formatted = formatCommentBlock(fullResponse);
-                if (formatted) {
-                    const endLine = selection.end.line;
-                    await editor.edit(editBuilder => {
-                        editBuilder.insert(new vscode.Position(endLine + 1, 0), '\n' + formatted + '\n');
-                    });
-                } else {
-                    vscode.window.showWarningMessage('Ollama 返回了空结果或格式异常，请重试。');
-                }
-                return;
+            // ---- 流结束：处理残留 ----
+            // lineBuffer 中可能还有最后一行（没有 \n 结尾）
+            if (lineBuffer.trim()) {
+                await processLine(lineBuffer);
             }
 
-            // 从下往上插入（避免行号偏移）
-            const lineNums = Array.from(commentMap.keys()).sort((a, b) => b - a);
+            // 插入最后一个 pending 块
+            if (pending) {
+                await insertPending(pending);
+                pending = null;
+            }
 
-            await editor.edit(editBuilder => {
-                for (const relLineNum of lineNums) {
-                    const absLine = startLine + (relLineNum - 1);
-                    const comment = commentMap.get(relLineNum)!;
-                    editBuilder.insert(new vscode.Position(absLine + 1, 0), comment + '\n');
-                }
-            });
-
-            channel.appendLine(`✅ 已插入 ${commentMap.size} 处注释！`);
+            channel.appendLine(`\n✅ 注释生成完成！共插入 ${insertedCount} 处注释。`);
             progress.report({ message: '✅ 注释生成完成！' });
 
         } catch (err: unknown) {
