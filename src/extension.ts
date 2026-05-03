@@ -1,7 +1,8 @@
 import * as vscode from 'vscode';
-import { scanProject } from './projectScanner';
+import { buildSymbolIndex, buildSummary, detectProjectType } from './projectScanner';
 import { callOllamaStream, checkOllamaHealth } from './ollama';
-import { buildPrompt } from './commentGenerator';
+import { buildDeepPrompt } from './commentGenerator';
+import { resolveCallChain } from './callGraph';
 import { formatCommentBlock } from './formatter';
 import { getConfig } from './settings';
 
@@ -34,12 +35,7 @@ interface PendingBlock {
 
 /**
  * 核心逻辑：流式生成 + 渐进式按行插入
- *
- * 流程：
- * 1. Ollama 流式输出 token
- * 2. 按行累积（遇到 \n），检测 marker（--- 行 N ---）
- * 3. 看到 marker → 说明上一块完整 → 立即插入上一块
- * 4. 流结束后 flush 最后一个 pending 块
+ * 增强版：包含符号索引和调用链解析
  */
 async function explainSelectedCode(): Promise<void> {
     const editor = vscode.window.activeTextEditor;
@@ -58,7 +54,7 @@ async function explainSelectedCode(): Promise<void> {
     const startLine = selection.start.line;
     const channel = getOutputChannel();
     channel.clear();
-    channel.show(true); // 显示但不抢焦点
+    channel.show(true);
 
     // 健康检查
     const ollamaAvailable = await checkOllamaHealth();
@@ -90,35 +86,70 @@ async function explainSelectedCode(): Promise<void> {
             const doc = editor.document;
             const fileUri = doc.uri;
             const filePath = doc.fileName;
-            const projectContext = await scanProject(fileUri);
 
-            progress.report({ message: '🤖 Ollama 正在生成（注释将逐块插入）...' });
+            // ---- 构建符号索引（带缓存）----
+            progress.report({ message: '📊 构建符号索引...' });
+            channel.appendLine('📊 构建符号索引...\n');
+
+            const symbolIndex = await buildSymbolIndex(fileUri);
+            const projectType = detectProjectType(symbolIndex.rootPath || path.dirname(filePath));
+            const summary = buildSummary(projectType, symbolIndex);
+
+            // ---- 解析调用链 ----
+            progress.report({ message: '🔗 解析调用链...' });
+            channel.appendLine('🔗 解析函数调用链...\n');
+
+            const relFilePath = symbolIndex.rootPath
+                ? path.relative(symbolIndex.rootPath, filePath)
+                : filePath;
+
+            const callChain = await resolveCallChain(
+                selectedText,
+                symbolIndex,
+                relFilePath,
+                3500  // 最多 3500 tokens 给上下文
+            );
+
+            if (callChain.definitions.length > 0) {
+                channel.appendLine(`  ✅ 找到 ${callChain.definitions.length} 个相关函数/结构体`);
+                for (const def of callChain.definitions.slice(0, 5)) {
+                    channel.appendLine(`     - ${def.name} (${def.file}:${def.line})`);
+                }
+                if (callChain.definitions.length > 5) {
+                    channel.appendLine(`     ... 还有 ${callChain.definitions.length - 5} 个`);
+                }
+            }
+            if (callChain.unresolvedNames.length > 0) {
+                channel.appendLine(`  ⚠️ ${callChain.unresolvedNames.length} 个无法解析（可能是标准库/内置）`);
+            }
+
+            // ---- 构建深度上下文 Prompt ----
+            progress.report({ message: '🤖 Ollama 正在生成（带深度上下文）...' });
 
             const language = detectLanguage(filePath);
-            const prompt = buildPrompt({
+            const projectContext = { rootPath: symbolIndex.rootPath || '', projectType, symbolIndex, summary };
+
+            const prompt = buildDeepPrompt({
                 selectedCode: selectedText,
                 projectContext,
+                callChain,
                 language,
                 filePath,
             });
 
             // ---- 渐进式插入状态 ----
-            let lineBuffer = '';                           // 当前行缓冲区
-            let pending: PendingBlock | null = null;      // 待插入的注释块
-            let lineOffset = 0;                            // 累积插入行数偏移
-            const insertedLines = new Set<number>();       // 已插入的行号（去重）
-            let insertedCount = 0;                         // 已插入块数
+            let lineBuffer = '';
+            let pending: PendingBlock | null = null;
+            let lineOffset = 0;
+            const insertedLines = new Set<number>();
+            let insertedCount = 0;
 
             // ---- 辅助函数：插入注释块 ----
             async function insertPending(block: PendingBlock): Promise<boolean> {
-                if (insertedLines.has(block.lineNum)) {
-                    return false;
-                }
+                if (insertedLines.has(block.lineNum)) return false;
 
                 const comment = block.content.trim();
-                if (!comment) {
-                    return false;
-                }
+                if (!comment) return false;
 
                 const formatted = formatCommentBlock(comment);
                 const absLine = startLine + (block.lineNum - 1) + lineOffset;
@@ -133,8 +164,7 @@ async function explainSelectedCode(): Promise<void> {
                     });
 
                     insertedLines.add(block.lineNum);
-                    const insertedLineCount = formatted.split('\n').length;
-                    lineOffset += insertedLineCount;
+                    lineOffset += formatted.split('\n').length;
                     insertedCount++;
 
                     channel.appendLine(`  ✅ [行 ${block.lineNum}] 已插入`);
@@ -149,23 +179,16 @@ async function explainSelectedCode(): Promise<void> {
             // ---- 辅助函数：处理一行完整文本 ----
             async function processLine(line: string): Promise<void> {
                 const trimmed = line.trim();
-                // 匹配 marker: --- 行 N ---
                 const match = trimmed.match(/^---\s*行\s*(\d+)\s*---$/i);
 
                 if (match) {
-                    // 这是 marker 行
                     const lineNum = parseInt(match[1], 10);
-
-                    // 插入上一块（如果有）
                     if (pending) {
                         await insertPending(pending);
                         pending = null;
                     }
-
-                    // 当前 marker 的注释内容等下一行
                     pending = { lineNum, content: '' };
                 } else {
-                    // 普通行：追加到 pending 内容
                     if (pending) {
                         pending.content += line;
                     }
@@ -173,49 +196,38 @@ async function explainSelectedCode(): Promise<void> {
             }
 
             // ---- 流式读取 Ollama ----
-            channel.append('🤖 ');
+            channel.append('\n🤖 ');
             let charCount = 0;
 
             for await (const token of callOllamaStream({ prompt })) {
                 charCount += token.length;
                 lineBuffer += token;
 
-                // Output Channel 打字机效果
                 channel.append(token);
 
-                // 持续处理完整行（可能多个）
                 while (true) {
                     const newlineIndex = lineBuffer.indexOf('\n');
-                    if (newlineIndex === -1) {
-                        break; // 没有完整行，等待更多 token
-                    }
+                    if (newlineIndex === -1) break;
 
-                    // 提取一行
                     const line = lineBuffer.slice(0, newlineIndex + 1);
                     lineBuffer = lineBuffer.slice(newlineIndex + 1);
 
-                    // 处理这一行
                     await processLine(line);
 
-                    // 进度更新（每插入 3 块更新一次通知）
                     if (insertedCount > 0 && insertedCount % 3 === 0) {
                         progress.report({ message: `🤖 已插入 ${insertedCount} 处注释...` });
                     }
                 }
 
-                // 全局进度通知（避免过于频繁）
                 if (charCount % 500 === 0) {
                     progress.report({ message: `🤖 已生成 ${charCount} 字符...` });
                 }
             }
 
             // ---- 流结束：处理残留 ----
-            // lineBuffer 中可能还有最后一行（没有 \n 结尾）
             if (lineBuffer.trim()) {
                 await processLine(lineBuffer);
             }
-
-            // 插入最后一个 pending 块
             if (pending) {
                 await insertPending(pending);
                 pending = null;
@@ -258,3 +270,6 @@ function detectLanguage(filePath: string): string {
     };
     return map[ext] || 'text';
 }
+
+// 引入 path（需要用于相对路径计算）
+import * as path from 'path';

@@ -1,6 +1,7 @@
 import { ProjectContext } from './projectScanner';
+import { CallChainContext } from './callGraph';
 
-/** 注释风格示例（来自用户提供的 CUDA 示例，取最具代表性的几条） */
+/** 注释风格示例（来自用户提供的 CUDA 示例） */
 const EXAMPLE_COMMENTS = `【示例风格参考】
 \`\`\`c
 #include <cstdint>
@@ -30,15 +31,109 @@ const EXAMPLE_COMMENTS = `【示例风格参考】
  * 【作用】将 [0, 255] 的整数值归一化到 [0.0, 1.0] 的浮点值。
  * 【原理】隐式将 uint8_t 提升为 float 后执行除法。
  * 【优化空间】浮点除法非常慢，吞吐量远低于乘法。
- * 更好方法】改为乘以倒数：float val = src[idx] * 0.00392156862745098f;
+ * 【更好方法】改为乘以倒数：float val = src[idx] * 0.00392156862745098f;
  *             或者 float val = src[idx] * (1.0f / 255.0f);
  * 【为什么不用】依赖编译器的 -ffast-math 选项自动优化，或作者未关注此微优化。
  */
 \`\`\``;
 
 /**
- * 构造发送给 Ollama 的完整 Prompt
- * 关键：让模型只返回注释块，每个块前加行号标记，插件负责插入到对应位置
+ * 深度上下文 Prompt（增强版）
+ * 包含被调用函数的完整定义，让模型能做原理级讲解
+ */
+export function buildDeepPrompt(params: {
+    selectedCode: string;
+    projectContext: ProjectContext;
+    callChain: CallChainContext;
+    language: string;
+    filePath: string;
+}): string {
+    const { selectedCode, projectContext, callChain, language, filePath } = params;
+
+    // 给选中代码加行号
+    const lines = selectedCode.split('\n');
+    const numberedCode = lines
+        .map((line, i) => `[${i + 1}] ${line}`)
+        .join('\n');
+
+    // 构建被调用函数定义部分
+    let definitionsSection = '';
+    if (callChain.definitions.length > 0) {
+        const defBlocks = callChain.definitions.map(def => {
+            return `【${def.name}】(${def.kind}) - 位于 ${def.file}:${def.line}
+\`\`\`${language}
+${def.body}
+\`\`\``;
+        });
+        definitionsSection = `
+## 被调用函数定义（工程内相关代码）
+${defBlocks.join('\n\n')}
+`;
+    }
+
+    // 构建未解析的调用部分
+    let unresolvedSection = '';
+    if (callChain.unresolvedNames.length > 0) {
+        unresolvedSection = `
+## 无法解析的调用（工程外/内置函数）
+${callChain.unresolvedNames.map(n => `- ${n}()`).join('\n')}
+（可能是标准库函数、内置函数，或工程外定义的函数）
+`;
+    }
+
+    return `你是一位追求极致的技术专家，正在为代码添加学习型详解注释。
+
+## 任务目标
+**核心目标：搞懂原理、吃透代码。**
+
+你的注释不是简单的"这行代码干了什么"，而是：
+1. 深入原理：为什么是这样实现的？
+2. 依赖关系：这一行调用了哪些函数/变量？它们是怎么工作的？
+3. 上下文关联：与工程里的其他代码有什么关联？
+4. 优化空间：有没有更好的写法？时间和空间复杂度如何？
+5. 限制条件：已知的边界情况、潜在 Bug、性能瓶颈是什么？
+
+${definitionsSection}${unresolvedSection}
+## 项目架构摘要
+${projectContext.summary}
+
+## 带行号的选中代码
+\`\`\`${language}
+${numberedCode}
+\`\`\`
+
+## 输出格式
+为每个**非空行**生成注释块，用 "--- 行 N ---" 分隔（N 是原代码的行号）：
+
+--- 行 1 ---
+/*
+ * 【作用】...
+ * 【原理】...
+ * 【依赖分析】...（涉及被调用函数时必填）
+ * 【为什么这么做】...
+ * 【优化空间】...（如有）
+ * 【限制】...（如有）
+ */
+
+--- 行 3 ---
+/*
+ * 【作用】...
+ * ...
+ */
+
+## 注释块规则
+- 以 /* 开头，以 */ 结尾
+- 每行前缀为 " * "
+- **不截断**：内容自然展开，原理讲透
+- 如果某项无内容，写"（无）"或直接省略该项
+- 空行（原代码中的空行）不生成注释块
+- 结合【被调用函数定义】理解代码，说明本行是如何利用这些依赖工作的
+
+请严格按照"--- 行 N ---"格式输出，不要输出原代码、不要用 markdown 代码块包裹。`;
+}
+
+/**
+ * 原始的 Prompt（兼容旧逻辑）
  */
 export function buildPrompt(params: {
     selectedCode: string;
@@ -48,7 +143,7 @@ export function buildPrompt(params: {
 }): string {
     const { selectedCode, projectContext, language, filePath } = params;
 
-    // 给选中代码加行号，方便模型对应输出
+    // 给选中代码加行号
     const lines = selectedCode.split('\n');
     const numberedCode = lines
         .map((line, i) => `[${i + 1}] ${line}`)
@@ -98,20 +193,5 @@ ${projectContext.summary}
 ${numberedCode}
 \`\`\`
 
-请严格按照"--- 行 N ---"格式输出，不要输出原代码、不要用 markdown 代码块包裹。
-`;
-}
-
-/**
- * 解析 Ollama 返回的注释块，提取纯注释文本（去掉 markdown 代码块包裹）
- */
-export function parseCommentResponse(raw: string): string {
-    // 去掉 markdown 代码块标记
-    let cleaned = raw.trim();
-
-    // 去掉首尾的 markdown 代码块标记
-    cleaned = cleaned.replace(/^```[\w]*\n?/, '');
-    cleaned = cleaned.replace(/\n?```$/, '');
-
-    return cleaned.trim();
+请严格按照"--- 行 N ---"格式输出，不要输出原代码、不要用 markdown 代码块包裹。`;
 }
