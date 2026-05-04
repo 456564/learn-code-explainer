@@ -21,7 +21,8 @@ export async function callOllama(options: OllamaOptions): Promise<string> {
         stream: false,
         options: {
             temperature: 0.3,
-            num_predict: 2048,
+            num_predict: 8192,
+            num_ctx: 8192,
         }
     };
 
@@ -76,7 +77,8 @@ export async function* callOllamaStream(
         stream: true,
         options: {
             temperature: 0.3,
-            num_predict: 2048,
+            num_predict: 8192,
+            num_ctx: 8192,
         }
     };
 

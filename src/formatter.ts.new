@@ -2,11 +2,10 @@
  * 格式化注释块，包裹为 C 语言块注释风格。
  * 不截断，保持 AI 输出原样，只加星号前缀包裹。
  *
- * @param commentText  parse 后的纯注释文本（不包含 /∗ 和 ∗/ 标记）
- * @param indent      代码行的缩进前缀（如 "    "），注释块每行会保持相同缩进
- * @returns 包裹后的完整注释块（自动加 /∗ 开头和 ∗/ 结尾）
+ * 输入：parse 后的纯注释文本
+ * 输出：包裹后的完整注释块
  */
-export function formatCommentBlock(commentText: string, indent: string = ''): string {
+export function formatCommentBlock(commentText: string): string {
     if (!commentText || commentText.trim().length === 0) {
         return '';
     }
@@ -14,41 +13,28 @@ export function formatCommentBlock(commentText: string, indent: string = ''): st
     // 统一换行符
     let text = commentText.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 
-    // 清理掉可能残留的 /* 和 */ 标记（防御：模型有时会自己加）
-    text = text.replace(/^\s*\/\*\s*/gm, '');
-    text = text.replace(/\s*\*\/\s*$/gm, '');
-
+    // 确保每行都有星号前缀（如果没有就加上）
     const lines = text.split('\n');
     const formatted: string[] = [];
 
     for (const line of lines) {
         const trimmed = line.trimEnd();
-
-        // 跳过纯标记行
         if (trimmed === '/*' || trimmed === '*/') {
-            continue;
-        }
-
-        // ★ 核心修复：去掉已有的 " * " 前缀（AI 可能已带前缀），再统一加标准前缀
-        let content = trimmed;
-        if (content.startsWith(' * ')) {
-            content = content.substring(3);  // 去掉 " * "
-        } else if (content.startsWith(' *') && content.length > 2) {
-            content = content.substring(2).trimStart();  // 去掉 " *" 并 trim
-        } else if (content.startsWith('* ')) {
-            content = content.substring(2);  // 去掉 "* "
-        } else if (content.startsWith('*')) {
-            content = content.substring(1).trimStart();  // 去掉 "*" 并 trim
-        }
-
-        if (content.length === 0) {
-            formatted.push(indent + ' *');
+            // 保留代码块标记行
+            formatted.push(trimmed);
+        } else if (trimmed.startsWith(' * ') || trimmed.startsWith(' *')) {
+            // 已有正确前缀
+            formatted.push(trimmed);
+        } else if (trimmed.length === 0) {
+            // 空行保留缩进
+            formatted.push(' *');
         } else {
-            formatted.push(indent + ' * ' + content);
+            // 没有星号前缀的行，加上前缀
+            formatted.push(' * ' + trimmed);
         }
     }
 
-    // 去掉首尾纯空行（保留缩进空行）
+    // 去掉首尾空行
     while (formatted.length > 0 && formatted[0].trim() === '') {
         formatted.shift();
     }
@@ -56,13 +42,9 @@ export function formatCommentBlock(commentText: string, indent: string = ''): st
         formatted.pop();
     }
 
-    if (formatted.length === 0) {
-        return '';
-    }
-
+    // 组装最终输出
     const body = formatted.join('\n');
-    // 每行都带相同缩进：/*  body  */
-    return indent + '/*\n' + body + '\n' + indent + ' */';
+    return '/*\n' + body + '\n */';
 }
 
 /**

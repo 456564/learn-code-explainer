@@ -7,7 +7,7 @@ import * as vscode from 'vscode';
  */
 export interface SymbolEntry {
     name: string;           // 符号名
-    kind: 'function' | 'struct' | 'macro' | 'global' | 'typedef' | 'enum';
+    kind: 'function' | 'struct' | 'class' | 'macro' | 'global' | 'typedef' | 'enum';
     file: string;           // 相对于根目录的路径
     absFile: string;       // 绝对路径
     line: number;          // 行号（1-based）
@@ -110,10 +110,8 @@ export async function buildSymbolIndex(targetUri: vscode.Uri): Promise<SymbolInd
     const cachePath = path.join(rootPath, CACHE_DIR, CACHE_FILE);
     const cached = loadCache(cachePath, rootPath);
     if (cached) {
-        // 验证缓存是否过期
-        if (!isCacheValid(cached)) {
-            return cached;
-        }
+        // 缓存有效（loadCache 已验证文件存在），直接返回
+        return cached;
     }
 
     // 构建新索引
@@ -155,15 +153,18 @@ async function createSymbolIndex(rootPath: string, maxFiles: number): Promise<Sy
             };
 
             // 提取各类符号
-            if (['.c', '.cpp', '.h', '.hpp', '.m', '.mm', '.java', '.cs', '.swift', '.kt', '.go', '.rs'].includes(ext)) {
+            if (['.cpp', '.hpp', '.cc', '.cxx', '.c', '.h', '.m', '.mm', '.java', '.cs', '.swift', '.kt', '.go', '.rs'].includes(ext)) {
                 fileSymbols.symbols.push(...extractCFunctions(content, filePath, relPath));
                 fileSymbols.symbols.push(...extractCStructs(content, filePath, relPath));
                 fileSymbols.symbols.push(...extractCMacros(content, filePath, relPath));
+                // 提取 C++ 类定义（class/struct，支持多行）
+                fileSymbols.symbols.push(...extractCClasses(content, filePath, relPath));
             } else if (ext === '.py') {
                 fileSymbols.symbols.push(...extractPyFunctions(content, filePath, relPath));
                 fileSymbols.symbols.push(...extractPyClasses(content, filePath, relPath));
             } else if (['.js', '.ts', '.tsx'].includes(ext)) {
                 fileSymbols.symbols.push(...extractJsFunctions(content, filePath, relPath));
+                fileSymbols.symbols.push(...extractJsClasses(content, filePath, relPath));
             }
 
             // 加入索引
@@ -326,6 +327,78 @@ function extractCMacros(content: string, absFile: string, relFile: string): Symb
 }
 
 // ============================================================
+// C++ 类符号提取（支持多行定义）
+// ============================================================
+
+/** 提取 C++ 类定义（class/struct，支持多行） */
+function extractCClasses(content: string, absFile: string, relFile: string): SymbolEntry[] {
+    const results: SymbolEntry[] = [];
+    const lines = content.split('\n');
+
+    // 匹配 class/struct 定义：class ClassName 或 struct StructName
+    // 支持继承：class ClassName : public Base
+    const classPattern = /(?:^|\n)([ \t]*)(?:export\s+)?(?:class|struct)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*(?::[^{]*)?\{/gm;
+
+    let match;
+    while ((match = classPattern.exec(content)) !== null) {
+        const indent = match[1];
+        const className = match[2];
+        const lineNum = (content.substring(0, match.index).match(/\n/g) || []).length + 1;
+
+        // 跳过模板特化等
+        if (className.includes('<')) continue;
+
+        // 提取基类信息（在同一行）
+        let baseClasses: string[] = [];
+        const lineText = lines[lineNum - 1];
+        const inheritMatch = lineText.match(/:\s*([^{]+)\{/);
+        if (inheritMatch) {
+            const bases = inheritMatch[1];
+            // 提取基类名（去掉 public/protected/private 和命名空间）
+            const baseMatches = bases.matchAll(/([a-zA-Z_][a-zA-Z0-9_]*)(?:::[a-zA-Z_][a-zA-Z0-9_]*)*/g);
+            for (const m of baseMatches) {
+                baseClasses.push(m[0]);
+            }
+        }
+
+        // 提取构造函数签名（在同一行附近找）
+        let ctorSignature = '';
+        for (let i = lineNum; i < Math.min(lineNum + 20, lines.length); i++) {
+            const candidate = lines[i];
+            // 匹配构造函数：ClassName(...) 或 ClassName(...) : initializer_list {
+            const ctorMatch = candidate.match(new RegExp(`${className}\\s*\\([^)]*\\)\\s*(?::[^;{]+)?\\s*\\{`));
+            if (ctorMatch) {
+                ctorSignature = ctorMatch[0].replace(/\\s+/g, ' ').trim();
+                break;
+            }
+            // 如果遇到单独的 {，说明没有内联构造函数
+            if (candidate.trim() === '{') {
+                break;
+            }
+        }
+
+        const isExported = !indent.includes('    '); // 有深缩进的可能是内部类
+
+        const kind: SymbolEntry['kind'] = 'class';
+        const signature = ctorSignature
+            ? `${kind} ${className} { ... } // ${ctorSignature}`
+            : `${kind} ${className}`;
+
+        results.push({
+            name: className,
+            kind,
+            file: relFile,
+            absFile,
+            line: lineNum,
+            signature,
+            isExported,
+        });
+    }
+
+    return results;
+}
+
+// ============================================================
 // Python 符号提取
 // ============================================================
 
@@ -422,6 +495,38 @@ function extractJsFunctions(content: string, absFile: string, relFile: string): 
             absFile,
             line: lineNum,
             signature: `const ${match[2]} = (...) => {...}`,
+            isExported: match[1].includes('export'),
+        });
+    }
+
+    return results;
+}
+
+/** 提取 JS/TS 类定义 */
+function extractJsClasses(content: string, absFile: string, relFile: string): SymbolEntry[] {
+    const results: SymbolEntry[] = [];
+
+    // 匹配 class ClassName 或 class ClassName extends BaseClass
+    const classPattern = /(?:^|\n)([ \t]*)(?:export\s+)?class\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*(?:extends\s+([a-zA-Z_$][a-zA-Z0-9_$]*))?\s*\{/gm;
+
+    let match;
+    while ((match = classPattern.exec(content)) !== null) {
+        const indent = match[1];
+        const className = match[2];
+        const baseClass = match[3] || '';
+        const lineNum = (content.substring(0, match.index).match(/\n/g) || []).length + 1;
+
+        const signature = baseClass
+            ? `class ${className} extends ${baseClass}`
+            : `class ${className}`;
+
+        results.push({
+            name: className,
+            kind: 'class',
+            file: relFile,
+            absFile,
+            line: lineNum,
+            signature,
             isExported: match[1].includes('export'),
         });
     }

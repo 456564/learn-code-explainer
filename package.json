@@ -2,7 +2,7 @@
   "name": "learn-code-explainer",
   "displayName": "Learn Code Explainer",
   "description": "学习型代码详解注释插件 — 读取整个工程上下文，生成逐行原理级注释",
-  "version": "0.3.0",
+  "version": "1.0.0",
   "publisher": "learner",
   "engines": {
     "vscode": "^1.85.0"
@@ -13,7 +13,7 @@
   "main": "./out/extension.js",
   "repository": {
     "type": "git",
-    "url": "https://github.com/learner/learn-code-explainer"
+    "url": "https://github.com/456564/learn-code-explainer"
   },
   "activationEvents": [
     "onCommand:learnCodeExplainer.explainCode"
